@@ -39,7 +39,11 @@ def ensure_indices(client: Elasticsearch) -> None:
 
 
 def seed_demo_data(client: Elasticsearch) -> Dict[str, Any]:
-    ensure_indices(client)
+    # Reset only demo indices so repeated demo runs stay clean.
+    for index_name in INDEX_NAMES:
+        if client.indices.exists(index=index_name):
+            client.indices.delete(index=index_name)
+        client.indices.create(index=index_name)
 
     docs_by_index = get_demo_documents()
     actions = []
@@ -64,8 +68,8 @@ def seed_demo_data(client: Elasticsearch) -> Dict[str, Any]:
         "inserted": success_count,
         "errors": errors,
         "indices": list(docs_by_index.keys()),
+        "reset": True,
     }
-
 
 def search_recent_logs(
     client: Elasticsearch,
