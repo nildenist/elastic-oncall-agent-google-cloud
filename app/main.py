@@ -11,6 +11,7 @@ from app.elastic_client import (
     seed_demo_data,
 )
 from app.notifier import format_incident_brief_for_slack, send_slack_notification
+from app.rate_limiter import allow_request
 from app.schemas import AlertPayload, FollowUpRequest
 from app.triage_agent import answer_followup, build_incident_brief_from_elastic
 
@@ -53,6 +54,12 @@ def seed_data() -> Dict[str, Any]:
 
 @app.post("/simulate-incident")
 def simulate_incident() -> Dict[str, Any]:
+    if not allow_request("simulate-incident", limit=10, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded for demo incident simulation. Please wait and try again.",
+        )
+
     try:
         payload = AlertPayload(**get_demo_alert_payload())
         return triage_alert(payload)
@@ -112,6 +119,18 @@ def latest_incident() -> Dict[str, Any]:
 
 @app.post("/ask-followup")
 def ask_followup(request: FollowUpRequest) -> Dict[str, Any]:
+    if not allow_request("ask-followup", limit=20, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded for demo follow-up questions. Please wait and try again.",
+        )
+
+    if len(request.question) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Question is too long for the public demo. Please keep it under 500 characters.",
+        )
+
     try:
         client = get_elastic_client()
         latest = get_latest_incident_brief(client)
@@ -172,12 +191,12 @@ def demo_page() -> str:
     .page {
       width: min(1120px, calc(100% - 32px));
       margin: 0 auto;
-      padding: 18px 0 16px 0;
+      padding: 16px 0 16px 0;
     }
 
     .hero {
       position: relative;
-      padding: 18px 24px;
+      padding: 16px 22px;
       border: 1px solid var(--border);
       border-radius: 24px;
       background:
@@ -216,12 +235,12 @@ def demo_page() -> str:
       color: #dbeafe;
       font-weight: 700;
       font-size: 12px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
     }
 
     h1 {
       margin: 0 0 8px 0;
-      font-size: clamp(28px, 3.4vw, 42px);
+      font-size: clamp(27px, 3.2vw, 40px);
       line-height: 1.04;
       letter-spacing: -0.045em;
       max-width: 900px;
@@ -237,7 +256,7 @@ def demo_page() -> str:
     .subtitle {
       max-width: 820px;
       color: var(--muted);
-      font-size: 15px;
+      font-size: 14px;
       line-height: 1.38;
       margin: 0;
     }
@@ -245,22 +264,22 @@ def demo_page() -> str:
     .grid {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 12px;
-      margin-top: 14px;
+      gap: 10px;
+      margin-top: 12px;
     }
 
     .card {
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 20px;
-      padding: 16px 20px;
+      padding: 14px 18px;
       box-shadow: 0 14px 45px rgba(0, 0, 0, 0.24);
       backdrop-filter: blur(14px);
     }
 
     .card h2 {
-      margin: 0 0 12px 0;
-      font-size: 20px;
+      margin: 0 0 10px 0;
+      font-size: 18px;
     }
 
     .flow {
@@ -300,28 +319,35 @@ def demo_page() -> str:
       backdrop-filter: blur(10px);
     }
 
-    button:nth-child(1) {
+    .btn-health {
       color: #dcfce7;
       background: linear-gradient(135deg, rgba(34, 197, 94, 0.34), rgba(22, 163, 74, 0.18));
       box-shadow: 0 10px 26px rgba(34, 197, 94, 0.14);
     }
 
-    button:nth-child(2) {
+    .btn-seed {
       color: #dbeafe;
       background: linear-gradient(135deg, rgba(14, 165, 233, 0.36), rgba(37, 99, 235, 0.20));
       box-shadow: 0 10px 26px rgba(14, 165, 233, 0.14);
     }
 
-    button:nth-child(3) {
+    .btn-simulate {
       color: #fce7f3;
       background: linear-gradient(135deg, rgba(168, 85, 247, 0.36), rgba(219, 39, 119, 0.22));
       box-shadow: 0 10px 26px rgba(168, 85, 247, 0.14);
     }
 
-    button:nth-child(4) {
+    .btn-latest {
       color: #fee2e2;
       background: linear-gradient(135deg, rgba(239, 68, 68, 0.46), rgba(185, 28, 28, 0.30));
       box-shadow: 0 10px 26px rgba(239, 68, 68, 0.18);
+    }
+
+    .btn-ask {
+      color: #ede9fe;
+      background: linear-gradient(135deg, rgba(66, 133, 244, 0.38), rgba(168, 85, 247, 0.26));
+      box-shadow: 0 10px 26px rgba(66, 133, 244, 0.18);
+      white-space: nowrap;
     }
 
     button:hover {
@@ -330,9 +356,44 @@ def demo_page() -> str:
       box-shadow: 0 14px 32px rgba(255, 255, 255, 0.08);
     }
 
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .side-panel {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    .ask-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input {
+      flex: 1;
+      min-height: 36px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(2, 6, 23, 0.58);
+      color: #e5e7eb;
+      padding: 8px 14px;
+      font-size: 13px;
+      outline: none;
+      min-width: 0;
+    }
+
+    input:focus {
+      border-color: rgba(147, 197, 253, 0.7);
+      box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.18);
+    }
+
     pre {
-      min-height: 150px;
-      max-height: 340px;
       background: rgba(2, 6, 23, 0.88);
       color: #d1d5db;
       padding: 14px;
@@ -345,14 +406,24 @@ def demo_page() -> str:
       margin: 0;
     }
 
+    .incident-output {
+      min-height: 290px;
+      max-height: 430px;
+    }
+
+    .agent-output {
+      min-height: 172px;
+      max-height: 250px;
+    }
+
     .footer {
-      margin-top: 12px;
+      margin-top: 10px;
       color: #94a3b8;
       font-size: 12px;
       text-align: center;
     }
 
-    @media (max-width: 860px) {
+    @media (max-width: 900px) {
       .page {
         width: min(100% - 22px, 1120px);
         padding-top: 14px;
@@ -371,6 +442,10 @@ def demo_page() -> str:
         font-size: 14px;
       }
 
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+
       .controls {
         gap: 8px;
       }
@@ -378,6 +453,23 @@ def demo_page() -> str:
       button {
         flex: 1 1 calc(50% - 8px);
         min-width: 140px;
+      }
+
+      .ask-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .ask-row button {
+        width: 100%;
+      }
+
+      .incident-output {
+        min-height: 220px;
+      }
+
+      .agent-output {
+        min-height: 160px;
       }
     }
 
@@ -406,19 +498,15 @@ def demo_page() -> str:
       button {
         flex: 1 1 100%;
       }
-
-      pre {
-        min-height: 140px;
-      }
     }
 
-    @media (max-height: 760px) and (min-width: 861px) {
+    @media (max-height: 760px) and (min-width: 901px) {
       .page {
         padding-top: 10px;
       }
 
       .hero {
-        padding: 15px 22px;
+        padding: 14px 22px;
       }
 
       h1 {
@@ -430,22 +518,27 @@ def demo_page() -> str:
       }
 
       .grid {
-        gap: 10px;
-        margin-top: 12px;
+        gap: 9px;
+        margin-top: 10px;
       }
 
       .card {
-        padding: 14px 18px;
+        padding: 13px 18px;
       }
 
       .card h2 {
-        font-size: 18px;
-        margin-bottom: 10px;
+        font-size: 17px;
+        margin-bottom: 9px;
       }
 
-      pre {
-        min-height: 120px;
-        max-height: 240px;
+      .incident-output {
+        min-height: 250px;
+        max-height: 350px;
+      }
+
+      .agent-output {
+        min-height: 150px;
+        max-height: 220px;
       }
     }
   </style>
@@ -476,22 +569,44 @@ def demo_page() -> str:
           <span>Probable root cause</span>
           <span>Safe next action</span>
           <span>Slack notification</span>
+          <span>Ask follow-up</span>
         </div>
       </div>
 
       <div class="card">
         <h2>Demo controls</h2>
         <div class="controls">
-          <button onclick="health()">Health check</button>
-          <button onclick="seed()">Seed demo data</button>
-          <button onclick="simulate()">Simulate incident</button>
-          <button onclick="latest()">Latest incident</button>
+          <button class="btn-health" onclick="health()">Health check</button>
+          <button class="btn-seed" onclick="seed()">Seed demo data</button>
+          <button class="btn-simulate" onclick="simulate()">Simulate incident</button>
+          <button class="btn-latest" onclick="latest()">Latest incident</button>
         </div>
       </div>
 
-      <div class="card">
-        <h2>Output</h2>
-        <pre id="output">Click a button to start.</pre>
+      <div class="workspace">
+        <div class="card">
+          <h2>Incident output</h2>
+          <pre id="incident-output" class="incident-output">Click Seed demo data, then Simulate incident.</pre>
+        </div>
+
+        <div class="side-panel">
+          <div class="card">
+            <h2>Ask Agent</h2>
+            <div class="ask-row">
+              <input
+                id="question"
+                value="Why do you think this is deployment-related?"
+                placeholder="Ask a follow-up question"
+              />
+              <button class="btn-ask" onclick="askAgent()">Ask agent</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Agent answer</h2>
+            <pre id="agent-output" class="agent-output">Ask a question after simulating an incident.</pre>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -501,14 +616,53 @@ def demo_page() -> str:
   </main>
 
   <script>
-    async function callApi(path, method = "GET") {
-      const output = document.getElementById("output");
+    async function callApi(path, method = "GET", body = null) {
+      const output = document.getElementById("incident-output");
       output.textContent = "Running " + method + " " + path + " ...";
 
       try {
-        const response = await fetch(path, { method });
+        const options = { method };
+
+        if (body !== null) {
+          options.headers = { "Content-Type": "application/json" };
+          options.body = JSON.stringify(body);
+        }
+
+        const response = await fetch(path, options);
         const data = await response.json();
         output.textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        output.textContent = "Error: " + error;
+      }
+    }
+
+    async function askAgent() {
+      const output = document.getElementById("agent-output");
+      const question = document.getElementById("question").value;
+
+      output.textContent = "Asking agent...";
+
+      try {
+        const response = await fetch("/ask-followup", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ question })
+        });
+
+        const data = await response.json();
+        const agentResponse = data.response || {};
+        const evidence = agentResponse.evidence_used || [];
+
+        output.textContent =
+          "Agent answer\\n" +
+          "============\\n\\n" +
+          (agentResponse.answer || "No answer returned.") +
+          "\\n\\n" +
+          "Evidence used\\n" +
+          "-------------\\n" +
+          evidence.map((item) => "- " + item).join("\\n");
       } catch (error) {
         output.textContent = "Error: " + error;
       }

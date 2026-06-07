@@ -10,6 +10,10 @@ from app.elastic_client import (
     search_related_logs,
     search_runbooks_and_incidents,
 )
+from app.gemini_agent import (
+    answer_followup_with_gemini,
+    generate_incident_brief_with_gemini,
+)
 from app.schemas import (
     AlertPayload,
     EvidenceItem,
@@ -23,16 +27,27 @@ def _metric_value(metrics: List[Dict[str, Any]], metric_name: str) -> List[Any]:
     return [item.get("value") for item in metrics if item.get("metric") == metric_name]
 
 
-def build_incident_brief_from_elastic(
+def _collect_elastic_evidence(
     client: Elasticsearch,
     alert: AlertPayload,
-) -> IncidentBrief:
+) -> Dict[str, Any]:
     service = alert.service
     related_service = str(alert.metadata.get("related_service", "payment-service"))
 
-    service_logs = search_recent_logs(client, service=service, environment=alert.environment)
-    related_logs = search_recent_logs(client, service=related_service, environment=alert.environment)
-    redis_logs = search_related_logs(client, "RedisTimeoutError connection pool checkout payment")
+    service_logs = search_recent_logs(
+        client,
+        service=service,
+        environment=alert.environment,
+    )
+    related_logs = search_recent_logs(
+        client,
+        service=related_service,
+        environment=alert.environment,
+    )
+    redis_logs = search_related_logs(
+        client,
+        "RedisTimeoutError connection pool checkout payment",
+    )
     service_metrics = get_service_metrics(client, service=service)
     related_metrics = get_service_metrics(client, service=related_service)
     deploys = get_recent_deploys(client, service=service)
@@ -41,6 +56,30 @@ def build_incident_brief_from_elastic(
         "Redis timeout deployment checkout payment 5xx connection pool",
     )
 
+    return {
+        "service": service,
+        "related_service": related_service,
+        "environment": alert.environment,
+        "service_logs": service_logs,
+        "related_logs": related_logs,
+        "redis_logs": redis_logs,
+        "service_metrics": service_metrics,
+        "related_metrics": related_metrics,
+        "deploys": deploys,
+        "knowledge": knowledge,
+    }
+
+
+def _build_evidence_items(bundle: Dict[str, Any]) -> List[EvidenceItem]:
+    service = bundle["service"]
+    related_service = bundle["related_service"]
+
+    service_metrics = bundle["service_metrics"]
+    related_metrics = bundle["related_metrics"]
+    redis_logs = bundle["redis_logs"]
+    deploys = bundle["deploys"]
+    knowledge = bundle["knowledge"]
+
     latency_values = _metric_value(service_metrics, "latency_p95_ms")
     error_rate_values = _metric_value(related_metrics, "http_5xx_rate")
     cpu_values = _metric_value(service_metrics, "cpu_percent")
@@ -48,10 +87,10 @@ def build_incident_brief_from_elastic(
     restart_values = _metric_value(service_metrics, "pod_restarts")
 
     latest_deploy = deploys[0] if deploys else {}
-    runbook = knowledge["runbooks"][0] if knowledge["runbooks"] else {}
-    similar_incident = knowledge["incidents"][0] if knowledge["incidents"] else {}
+    runbook = knowledge["runbooks"][0] if knowledge.get("runbooks") else {}
+    similar_incident = knowledge["incidents"][0] if knowledge.get("incidents") else {}
 
-    evidence = [
+    return [
         EvidenceItem(
             source="Elastic metrics-service",
             title="Checkout latency spike",
@@ -110,7 +149,9 @@ def build_incident_brief_from_elastic(
         ),
     ]
 
-    hypotheses = [
+
+def _default_hypotheses() -> List[RootCauseHypothesis]:
+    return [
         RootCauseHypothesis(
             title="Redis client configuration regression after deployment",
             explanation=(
@@ -142,7 +183,11 @@ def build_incident_brief_from_elastic(
         ),
     ]
 
-    next_actions = [
+
+def _default_next_actions(service: str, deploys: List[Dict[str, Any]]) -> List[NextAction]:
+    latest_deploy = deploys[0] if deploys else {}
+
+    return [
         NextAction(
             title="Freeze new deployments",
             description="Pause further production deployments for affected services until mitigation is confirmed.",
@@ -173,13 +218,23 @@ def build_incident_brief_from_elastic(
         ),
     ]
 
-    timeline = [
+
+def _default_timeline() -> List[str]:
+    return [
         "T-14m: checkout-service v1.8.2 deployment detected",
         "T-10m: checkout-service p95 latency increased",
         "T-09m: RedisTimeoutError logs started increasing",
         "T-08m: payment-service 5xx rate increased",
         "T-now: agent prepared evidence-backed incident brief",
     ]
+
+
+def _build_deterministic_brief(
+    alert: AlertPayload,
+    bundle: Dict[str, Any],
+) -> IncidentBrief:
+    service = bundle["service"]
+    related_service = bundle["related_service"]
 
     return IncidentBrief(
         incident_id=f"incident-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
@@ -194,21 +249,108 @@ def build_incident_brief_from_elastic(
         ),
         confidence="high",
         affected_services=[service, related_service],
-        timeline=timeline,
-        evidence=evidence,
-        hypotheses=hypotheses,
-        next_actions=next_actions,
+        timeline=_default_timeline(),
+        evidence=_build_evidence_items(bundle),
+        hypotheses=_default_hypotheses(),
+        next_actions=_default_next_actions(service, bundle["deploys"]),
         human_approval_required=True,
     )
 
 
-def answer_followup(question: str, latest_brief: Dict[str, Any] | None) -> Dict[str, Any]:
-    if latest_brief is None:
-        return {
-            "answer": "No incident brief is available yet. Trigger or triage an incident first.",
-            "evidence_used": [],
-        }
+def _hypotheses_from_gemini(items: List[Dict[str, Any]]) -> List[RootCauseHypothesis]:
+    hypotheses: List[RootCauseHypothesis] = []
 
+    for item in items:
+        hypotheses.append(
+            RootCauseHypothesis(
+                title=str(item.get("title", "Gemini hypothesis")),
+                explanation=str(item.get("explanation", "")),
+                confidence=str(item.get("confidence", "medium")),
+                supporting_evidence=list(item.get("supporting_evidence", [])),
+            )
+        )
+
+    return hypotheses
+
+
+def _next_actions_from_gemini(items: List[Dict[str, Any]]) -> List[NextAction]:
+    actions: List[NextAction] = []
+
+    for item in items:
+        actions.append(
+            NextAction(
+                title=str(item.get("title", "Recommended action")),
+                description=str(item.get("description", "")),
+                requires_human_approval=bool(item.get("requires_human_approval", True)),
+                risk_level=str(item.get("risk_level", "medium")),
+            )
+        )
+
+    return actions
+
+
+def build_incident_brief_from_elastic(
+    client: Elasticsearch,
+    alert: AlertPayload,
+) -> IncidentBrief:
+    bundle = _collect_elastic_evidence(client, alert)
+    fallback_brief = _build_deterministic_brief(alert, bundle)
+
+    gemini_data = generate_incident_brief_with_gemini(
+        alert_payload=alert.model_dump(mode="json"),
+        evidence_bundle=bundle,
+    )
+
+    if gemini_data is None:
+        return fallback_brief
+
+    evidence = _build_evidence_items(bundle)
+    evidence.append(
+        EvidenceItem(
+            source="Google Vertex AI Gemini",
+            title="Gemini-backed reasoning",
+            detail=str(gemini_data.get("reasoning_engine", "Gemini reasoning completed")),
+            value="gemini_reasoning",
+            confidence="high",
+        )
+    )
+
+    hypotheses = _hypotheses_from_gemini(gemini_data.get("hypotheses", []))
+    if not hypotheses:
+        hypotheses = fallback_brief.hypotheses
+
+    next_actions = _next_actions_from_gemini(gemini_data.get("next_actions", []))
+    if not next_actions:
+        next_actions = fallback_brief.next_actions
+
+    timeline = list(gemini_data.get("timeline", [])) or fallback_brief.timeline
+    timeline.append("T-now: Gemini-backed reasoning generated the final incident brief")
+
+    return IncidentBrief(
+        incident_id=f"incident-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+        status="active",
+        summary=str(gemini_data.get("summary", fallback_brief.summary)),
+        probable_root_cause=str(
+            gemini_data.get("probable_root_cause", fallback_brief.probable_root_cause)
+        ),
+        confidence=str(gemini_data.get("confidence", fallback_brief.confidence)),
+        affected_services=list(
+            gemini_data.get("affected_services", fallback_brief.affected_services)
+        ),
+        timeline=timeline,
+        evidence=evidence,
+        hypotheses=hypotheses,
+        next_actions=next_actions,
+        human_approval_required=bool(
+            gemini_data.get("human_approval_required", True)
+        ),
+    )
+
+
+def _fallback_followup_answer(
+    question: str,
+    latest_brief: Dict[str, Any],
+) -> Dict[str, Any]:
     question_lower = question.lower()
 
     if "rollback" in question_lower:
@@ -249,4 +391,51 @@ def answer_followup(question: str, latest_brief: Dict[str, Any] | None) -> Dict[
         "evidence_used": [
             item.get("title", "evidence") for item in latest_brief.get("evidence", [])
         ],
+        "reasoning_engine": "deterministic_fallback",
     }
+
+
+def answer_followup(question: str, latest_brief: Dict[str, Any] | None) -> Dict[str, Any]:
+    if latest_brief is None:
+        return {
+            "answer": "No incident brief is available yet. Trigger or triage an incident first.",
+            "evidence_used": [],
+            "reasoning_engine": "deterministic_fallback",
+        }
+
+    gemini_response = answer_followup_with_gemini(
+        question=question,
+        latest_brief=latest_brief,
+    )
+
+    if gemini_response is not None:
+        answer = str(
+            gemini_response.get("answer")
+            or gemini_response.get("Answer")
+            or gemini_response.get("response")
+            or gemini_response.get("Response")
+            or ""
+        ).strip()
+
+        evidence_used = (
+            gemini_response.get("evidence_used")
+            or gemini_response.get("evidence")
+            or gemini_response.get("Evidence used")
+            or []
+        )
+
+        if isinstance(evidence_used, str):
+            evidence_used = [evidence_used]
+
+        if answer:
+            return {
+                "incident_id": latest_brief.get("incident_id"),
+                "answer": answer,
+                "evidence_used": list(evidence_used),
+                "reasoning_engine": gemini_response.get(
+                    "reasoning_engine",
+                    "Gemini on Vertex AI",
+                ),
+            }
+
+    return _fallback_followup_answer(question, latest_brief)
