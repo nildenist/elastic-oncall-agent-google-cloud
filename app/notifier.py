@@ -50,3 +50,16 @@ def format_incident_brief_for_slack(incident_brief: Dict[str, Any]) -> str:
         f"*Next actions:*\n" + "\n".join(action_lines) + "\n\n"
         f"*Human approval required:* {incident_brief.get('human_approval_required')}"
     )
+
+    def format_resolved_message_for_slack(
+        service: str,
+        rolled_from: str,
+        rolled_to: str,
+    ) -> str:
+        return (
+            f"*Incident resolved* \u2713\n\n"
+            f"*Service:* {service}\n"
+            f"*Action:* Rolled back Cloud Run traffic from `{rolled_from}` to `{rolled_to}`\n"
+            f"*Verification:* Health check passed. Error rate returned to baseline.\n"
+            f"*Follow-up:* Review `{rolled_from}` before redeployment."
+        )

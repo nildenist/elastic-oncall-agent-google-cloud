@@ -61,3 +61,9 @@ class FollowUpResponse(BaseModel):
     incident_id: Optional[str] = None
     answer: str
     evidence_used: List[str] = Field(default_factory=list)
+
+
+class RemediationRequest(BaseModel):
+    service: str = "checkout-api"
+    rolled_back_from: str = "checkout-api-00042"
+    rolled_back_to: str = "checkout-api-00041"

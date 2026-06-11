@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     demo_token: str = "local-demo-token"
     slack_webhook_url: str = ""
+    remediation_mode: str = "simulate"
 
     model_config = SettingsConfigDict(
         env_file=".env",
